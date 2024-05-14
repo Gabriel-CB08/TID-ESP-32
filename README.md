@@ -15,6 +15,14 @@ Desarrollar código y pruebas para configurar la comunicación entre un disposit
 - Realizar pruebas de funcionamiento.
 
 ### Bitacora
+Martes 19 de Marzo:
+Primera reunion con el profesor donde organizamos la idea del TID  y el paso a paso que deberiamos completar durante el desarrollo de este.
 
-sabado 11 de mayo:
-Buscamos formas de pasar un codigo arduino al del propio esp epressif
+Jueves 18 de Abril:
+Tercera reunion con el profesor para soldar los microcontroladores S3 para poder realizar pruebas con estos en el futuro.
+
+Sabado 11 de Mayo:
+Se creo el repositorio de Github, para poder trabajar en conjunto y tener un lugar para guardar los codigos junto con una bitacora para tener la informacion organizada de los pasos que se fueron desarrollando durante el TID.
+
+Martes 14 de Mayo:
+Durante la mañana se uso el metodo de integración de Arduino en Espresiff para comprobar los codigos creados por el grupo anterior, comprobar si estos se adaptan bien o requieren modificación.
