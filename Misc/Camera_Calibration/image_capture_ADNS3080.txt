@@ -1,0 +1,251 @@
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
+#include "driver/spi_master.h"
+#include "esp_log.h"
+#include "nvs_flash.h"
+
+// ADNS3080 hardware config
+#define ADNS3080_PIXELS_X                 30
+#define ADNS3080_PIXELS_Y                 30
+#define ADNS3080_CLOCK_SPEED        24000000
+
+// Register Map for the ADNS3080 Optical OpticalFlow Sensor
+#define ADNS3080_PRODUCT_ID            0x00
+#define ADNS3080_REVISION_ID           0x01
+#define ADNS3080_MOTION                0x02
+#define ADNS3080_DELTA_X               0x03
+#define ADNS3080_DELTA_Y               0x04
+#define ADNS3080_SQUAL                 0x05
+#define ADNS3080_PIXEL_SUM             0x06
+#define ADNS3080_MAXIMUM_PIXEL         0x07
+#define ADNS3080_CONFIGURATION_BITS    0x0a
+#define ADNS3080_EXTENDED_CONFIG       0x0b
+#define ADNS3080_DATA_OUT_LOWER        0x0c
+#define ADNS3080_DATA_OUT_UPPER        0x0d
+#define ADNS3080_SHUTTER_LOWER         0x0e
+#define ADNS3080_SHUTTER_UPPER         0x0f
+#define ADNS3080_FRAME_PERIOD_LOWER    0x10
+#define ADNS3080_FRAME_PERIOD_UPPER    0x11
+#define ADNS3080_MOTION_CLEAR          0x12
+#define ADNS3080_FRAME_CAPTURE         0x13
+#define ADNS3080_SROM_ENABLE           0x14
+#define ADNS3080_FRAME_PERIOD_MAX_BOUND_LOWER      0x19
+#define ADNS3080_FRAME_PERIOD_MAX_BOUND_UPPER      0x1a
+#define ADNS3080_FRAME_PERIOD_MIN_BOUND_LOWER      0x1b
+#define ADNS3080_FRAME_PERIOD_MIN_BOUND_UPPER      0x1c
+#define ADNS3080_SHUTTER_MAX_BOUND_LOWER           0x1e
+#define ADNS3080_SHUTTER_MAX_BOUND_UPPER           0x1e
+#define ADNS3080_SROM_ID               0x1f
+#define ADNS3080_OBSERVATION           0x3d
+#define ADNS3080_INVERSE_PRODUCT_ID    0x3f
+#define ADNS3080_PIXEL_BURST           0x40
+#define ADNS3080_MOTION_BURST          0x50
+#define ADNS3080_SROM_LOAD             0x60
+
+// Configuration Bits
+#define ADNS3080_LED_MODE_ALWAYS_ON        0x00
+#define ADNS3080_LED_MODE_WHEN_REQUIRED    0x01
+
+#define ADNS3080_RESOLUTION_400     400
+#define ADNS3080_RESOLUTION_1600    1600
+
+// Extended Configuration bits
+#define ADNS3080_SERIALNPU_OFF  0x02
+
+#define ADNS3080_FRAME_RATE_MAX         6469
+#define ADNS3080_FRAME_RATE_MIN         2000
+
+#define AP_SPI_DATAIN          GPIO_NUM_19  // MISO
+#define AP_SPI_DATAOUT         GPIO_NUM_23  // MOSI
+#define AP_SPI_CLOCK           GPIO_NUM_18  // SCK
+#define ADNS3080_CHIP_SELECT   GPIO_NUM_16  // SS
+#define ADNS3080_RESET         GPIO_NUM_14  // RESET
+
+static const char *TAG = "ADNS3080";
+spi_device_handle_t spi;
+
+int _cs_pin = ADNS3080_CHIP_SELECT;
+int _reset_pin = ADNS3080_RESET;
+unsigned int last_update;
+bool _overflow = false;
+bool _motion = false;
+int raw_dx;
+int raw_dy;
+unsigned int surface_quality;
+
+void init_spi() {
+    spi_bus_config_t buscfg = {
+        .miso_io_num = AP_SPI_DATAIN,
+        .mosi_io_num = AP_SPI_DATAOUT,
+        .sclk_io_num = AP_SPI_CLOCK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+    };
+
+    spi_device_interface_config_t devcfg = {
+        .clock_speed_hz = 2 * 1000 * 1000,  // Clock out at 2 MHz
+        .mode = 3,                          // SPI mode 3
+        .spics_io_num = ADNS3080_CHIP_SELECT,   // CS pin
+        .queue_size = 7,                    // We want to be able to queue 7 transactions at a time
+    };
+
+    ESP_ERROR_CHECK(spi_bus_initialize(HSPI_HOST, &buscfg, 1));
+    ESP_ERROR_CHECK(spi_bus_add_device(HSPI_HOST, &devcfg, &spi));
+}
+
+void reset() {
+    gpio_set_level(_reset_pin, 1);
+    ets_delay_us(10);
+    gpio_set_level(_reset_pin, 0);
+}
+
+uint8_t read_register(uint8_t reg) {
+    uint8_t result;
+    spi_transaction_t t;
+    memset(&t, 0, sizeof(t));
+    t.length = 8;
+    t.tx_buffer = &reg;
+    t.rx_buffer = &result;
+    t.flags = SPI_TRANS_USE_RXDATA;
+    gpio_set_level(_cs_pin, 0);
+    spi_device_transmit(spi, &t);
+    gpio_set_level(_cs_pin, 1);
+    ets_delay_us(50);
+    return result;
+}
+
+void write_register(uint8_t reg, uint8_t value) {
+    uint8_t data[2] = {reg | 0x80, value};
+    spi_transaction_t t;
+    memset(&t, 0, sizeof(t));
+    t.length = 16;
+    t.tx_buffer = data;
+    gpio_set_level(_cs_pin, 0);
+    spi_device_transmit(spi, &t);
+    gpio_set_level(_cs_pin, 1);
+    ets_delay_us(50);
+}
+
+bool initOF() {
+    int retry = 0;
+
+    gpio_set_direction(AP_SPI_DATAOUT, GPIO_MODE_OUTPUT);
+    gpio_set_direction(AP_SPI_DATAIN, GPIO_MODE_INPUT);
+    gpio_set_direction(AP_SPI_CLOCK, GPIO_MODE_OUTPUT);
+    gpio_set_direction(_cs_pin, GPIO_MODE_OUTPUT);
+    gpio_set_direction(_reset_pin, GPIO_MODE_OUTPUT);
+
+    gpio_set_level(_cs_pin, 1);
+    reset();
+
+    init_spi();
+
+    while (retry < 3) {
+        if (read_register(ADNS3080_PRODUCT_ID) == 0x17)
+            return true;
+        retry++;
+    }
+
+    return false;
+}
+
+void print_pixel_data() {
+    int i, j;
+    bool isFirstPixel = true;
+    uint8_t regValue;
+    uint8_t pixelValue;
+
+    write_register(ADNS3080_FRAME_CAPTURE, 0x83);
+    ets_delay_us(1510);
+
+    for (i = 0; i < ADNS3080_PIXELS_Y; i++) {
+        for (j = 0; j < ADNS3080_PIXELS_X; j++) {
+            regValue = read_register(ADNS3080_FRAME_CAPTURE);
+            if (isFirstPixel && (regValue & 0x40) == 0) {
+                ESP_LOGI(TAG, "failed to find first pixel");
+            }
+            isFirstPixel = false;
+            pixelValue = (regValue << 2);
+            printf("%d,", pixelValue);
+            ets_delay_us(50);
+        }
+        printf("\n");
+    }
+
+    reset();
+}
+
+void display_image() {
+    ESP_LOGI(TAG, "image data --------------");
+    print_pixel_data();
+    ESP_LOGI(TAG, "-------------------------");
+}
+
+void display_image_continuously() {
+    ESP_LOGI(TAG, "press any key to return to menu");
+    while (true) {
+        display_image();
+        vTaskDelay(2000 / portTICK_PERIOD_MS);
+    }
+}
+
+void display_motion() {
+    ESP_LOGI(TAG, "press x to return to menu..");
+    while (true) {
+        updateOF();
+        if (_overflow) {
+            ESP_LOGI(TAG, "overflow!!");
+        }
+        ESP_LOGI(TAG, "dx: %d\tdy: %d\tsqual: %u", raw_dx, raw_dy, surface_quality);
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+    }
+}
+
+bool updateOF() {
+    uint8_t motion_reg;
+    surface_quality = read_register(ADNS3080_SQUAL);
+    ets_delay_us(50);
+
+    motion_reg = read_register(ADNS3080_MOTION);
+    _overflow = ((motion_reg & 0x10) != 0);
+    if (motion_reg & 0x80) {
+        raw_dx = (int8_t)read_register(ADNS3080_DELTA_X);
+        ets_delay_us(50);
+        raw_dy = (int8_t)read_register(ADNS3080_DELTA_Y);
+        _motion = true;
+    } else {
+        raw_dx = 0;
+        raw_dy = 0;
+    }
+    last_update = esp_log_timestamp();
+
+    return true;
+}
+
+void display_menu() {
+    ESP_LOGI(TAG, "please choose from the following options:");
+    ESP_LOGI(TAG, "     i - display image");
+    ESP_LOGI(TAG, "     I - display image continuously");
+    ESP_LOGI(TAG, "     m - display motion");
+}
+
+void app_main() {
+    ESP_ERROR_CHECK(nvs_flash_init());
+    ESP_LOGI(TAG, "www.bot-thoughts.com\nOptical Flow test program V1.0");
+    ESP_LOGI(TAG, "Based on APM/ArduCopter AP_OpticalFlow library by Randy Mackay");
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+
+    if (!initOF()) {
+        ESP_LOGE(TAG, "Failed to initialise ADNS3080");
+    }
+
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+
+    while (true) {
+        display_menu();
+        // Wait for user input
+        // Implement a mechanism to read user input from UART and call the appropriate function
+        vTaskDelay(10000 / portTICK_PERIOD_MS);  // Placeholder for user input delay
+    }
+}
