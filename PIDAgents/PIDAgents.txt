@@ -1,0 +1,195 @@
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/event_groups.h"
+#include "esp_log.h"
+#include "esp_wifi.h"
+#include "esp_now.h"
+#include "nvs_flash.h"
+#include "mqtt_client.h"
+#include "driver/gpio.h"
+#include "PID_v1.h"
+#include <string.h>
+
+#define DATARATE        WIFI_PHY_RATE_6M   // Para cambiar el bitrate de ESP-NOW a 24Mbps
+#define CHANNEL         11                   // Canal WiFi
+#define DELAY_CAM       800
+
+#define ONBOARD_LED  GPIO_NUM_2
+
+#define CARRO_ID        0
+
+typedef struct filterIIR {
+    double x_vec[20];
+    double y_vec[20];
+    double b[20];
+    double a[20];
+    double G;
+    int N;
+    filterIIR(int N_points, double *b_coeff, double *a_coeff, double gain = 1) {
+        N = N_points;
+        G = gain;
+        memset(x_vec, 0, N*sizeof(double));
+        memset(y_vec, 0, N*sizeof(double));
+        memset(b, 0, N*sizeof(double));
+        memset(a, 0, N*sizeof(double));
+        if (b_coeff != NULL)
+            memcpy(b, b_coeff, N*sizeof(double));
+        if (a_coeff != NULL)
+            memcpy(a, a_coeff, N*sizeof(double));
+    }
+} filterIIR_t;
+
+typedef struct leaderData {
+    float velocity;
+} leaderData_t;
+
+leaderData_t rcv_data;
+uint8_t mac_leader[] = {0x24, 0x0A, 0xC4, 0xAA, 0xBB, 0xCC}; // replace with actual MAC
+
+double Setpoint, Input, Output;
+PID myPID(&Input, &Output, &Setpoint, 2, 5, 1, DIRECT);
+
+esp_mqtt_client_handle_t client;
+double Kp = 2, Ki = 5, Kd = 1;
+double Kp_v = 2, Ki_v = 5, Kd_v = 1;
+double etha = 1;
+double h = 0.1;
+double alpha = 0.9;
+double SampleTime = 100;
+bool run_test = false;
+int umax = 255;
+int umin = -255;
+float v_leader = 0.0;
+float x_ref = 0.0;
+uint32_t rcv_time = 0;
+
+static void log_error_if_nonzero(const char *message, int error_code) {
+    if (error_code != ESP_OK) {
+        ESP_LOGE("Error", "%s: %d", message, error_code);
+    }
+}
+
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
+    esp_mqtt_event_handle_t event = event_data;
+    client = event->client;
+    switch ((esp_mqtt_event_id_t)event_id) {
+    case MQTT_EVENT_CONNECTED:
+        ESP_LOGI("MQTT", "MQTT_EVENT_CONNECTED");
+        esp_mqtt_client_subscribe(client, "trenes/#", 0);
+        break;
+    case MQTT_EVENT_DISCONNECTED:
+        ESP_LOGI("MQTT", "MQTT_EVENT_DISCONNECTED");
+        break;
+    case MQTT_EVENT_DATA:
+        ESP_LOGI("MQTT", "MQTT_EVENT_DATA");
+        char *topic = strndup(event->topic, event->topic_len);
+        char *message = strndup(event->data, event->data_len);
+        handle_mqtt_message(topic, message);
+        free(topic);
+        free(message);
+        break;
+    default:
+        break;
+    }
+}
+
+void handle_mqtt_message(char* topic, char* message) {
+    if (strcmp(topic, "trenes/carroD/p") == 0) {
+        Kp = atof(message);
+    }
+    if (strcmp(topic, "trenes/carroD/i") == 0) {
+        Ki = atof(message);
+    }
+    if (strcmp(topic, "trenes/carroD/d") == 0) {
+        Kd = atof(message);
+    }
+    if (strcmp(topic, "trenes/carroD/p_v") == 0) {
+        Kp_v = atof(message);
+    }
+    if (strcmp(topic, "trenes/carroD/i_v") == 0) {
+        Ki_v = atof(message);
+    }
+    if (strcmp(topic, "trenes/carroD/d_v") == 0) {
+        Kd_v = atof(message);
+    }
+    if (strcmp(topic, "trenes/etha") == 0) {
+        etha = atof(message);
+    }
+    if (strcmp(topic, "trenes/h") == 0) {
+        h = atof(message);
+    }
+    if (strcmp(topic, "trenes/alpha") == 0) {
+        alpha = atof(message);
+    }
+    if (strcmp(topic, "trenes/start") == 0) {
+        run_test = true;
+    }
+    if (strcmp(topic, "trenes/u_lim") == 0) {
+        umax = atoi(message);
+        umin = -umax;
+    }
+    if (strcmp(topic, "trenes/carroL/v_leader") == 0) {
+        v_leader = atof(message);
+    }
+    if (strcmp(topic, "trenes/ref") == 0) {
+        x_ref = atof(message);
+    }
+    if (strcmp(topic, "trenes/carroD/ts") == 0) {
+        SampleTime = atoi(message);
+    }
+    if (strcmp(topic, "trenes/envio") == 0) {
+        t_envio = atoi(message);
+    }
+}
+
+void app_main() {
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    gpio_set_direction(ONBOARD_LED, GPIO_MODE_OUTPUT);
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_ERROR_CHECK(esp_now_init());
+    ESP_ERROR_CHECK(esp_now_register_send_cb(OnDataSent));
+    ESP_ERROR_CHECK(esp_now_register_recv_cb(OnDataRecv));
+
+    esp_now_peer_info_t peer_info = {};
+    memcpy(peer_info.peer_addr, mac_leader, 6);
+    peer_info.channel = CHANNEL;
+    peer_info.ifidx = ESP_IF_WIFI_STA;
+    peer_info.encrypt = false;
+    ESP_ERROR_CHECK(esp_now_add_peer(&peer_info));
+
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .uri = "mqtt://mqtt_broker_uri",
+    };
+    client = esp_mqtt_client_init(&mqtt_cfg);
+    esp_mqtt_client_register_event(client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+    ESP_ERROR_CHECK(esp_mqtt_client_start(client));
+
+    myPID.SetMode(AUTOMATIC);
+}
+
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+    ESP_LOGI("ESP-NOW", "Send status: %s", status == ESP_NOW_SEND_SUCCESS ? "Success" : "Fail");
+}
+
+void OnDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
+    ESP_LOGI("ESP-NOW", "Data received");
+    int mac_eq = (mac[0]==mac_leader[0])+(mac[1]==mac_leader[1])+(mac[2]==mac_leader[2]);
+    mac_eq += (mac[3]==mac_leader[3])+(mac[4]==mac_leader[4])+(mac[5]==mac_leader[5]);
+    if(mac_eq < 6){
+        return;
+    }
+    memcpy(&rcv_data, data, len);
+    v_leader = rcv_data.velocity;
+    rcv_time = esp_log_timestamp();
+}
