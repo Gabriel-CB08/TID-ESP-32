@@ -43,6 +43,19 @@ Se realiza instalación de ESP-IDF en el OS y paralelamente la transcripción de
 Miércoles 29 de Mayo:
 Revisión de avances y discusión junto al profesor. Definición de pasos a seguir para cuando se termine la migración del código. Fijación de fecha para probar nuevo código en el proyecto físico.
 
+Jueves 6 de Junio:
+Se comenzó la traducción del codigo anterior intentando mantener la estructura de este mismo
+
+Martes 25 de Junio: 
+70-80% del codigo traducido en su totalidad 
+
+Viernes 5 de Julio: 
+Completada la traduccion del codigo y la preparacion para comprobar el correcto funcionamiento de cada uno y la evaluacion de estos.
+
+
+
+
+
 
 
 
