@@ -1,0 +1,380 @@
+/*
+ * Last Modified: 04-19-2022
+ */
+
+#include <PID_v1.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include "SPI.h"
+#include <Wire.h>   // ???
+#include <VL53L0X.h>  // Pololu 1.0.2
+#include <esp_wifi.h>
+#include <esp_now.h>
+#include <WiFiUDP.h>
+#include "math.h"
+
+#include "KickFiltersRT.h"
+
+#define DATARATE        WIFI_PHY_RATE_6M   // Para cambiar el bitrate de ESP-NOW a 24Mbps
+#define CHANNEL         3                   // Canal WiFi
+#define DELAY_CAM       800
+
+#define ONBOARD_LED  2
+
+#define PAYLOAD_SIZE    6     // numero de doubles para monitoreo
+#define Ts              20    // tiempo en ms
+
+#define n_carro         0     // lider = 0
+
+////////////////////////////////////////////
+///////////////////////////////////////////
+String carro = "carro" + String(random(100));
+//const char carro[] = "carroD2";
+char treneserror[] = "trenes/carroD/error";
+char trenesp[] = "trenes/carroD/p";
+char trenesi[] = "trenes/carroD/i";
+char trenesd[] = "trenes/carroD/d";
+char trenesp_v[] = "trenes/carroD/p_v";
+char trenesi_v[] = "trenes/carroD/i_v";
+char trenesd_v[] = "trenes/carroD/d_v";
+char trenesdesfase[] = "trenes/carroD/desfase";
+char trenesestado[] = "trenes/estado/carroD"; 
+char trenestest[] = "trenes/carroD/test";     // topic to send the data to analyze separated by "," (deprecated?)
+char trenessampletime[] = "trenes/carroD/ts"; // topic to modify the PID sample time
+char trenestransmision[] = "trenes/envio";    // topic to modify the transmission rate
+int t_envio = 50;                             // default tx-rate;
+///////////////////////////////////////////
+/////////////////////////////////////////// 
+
+typedef struct filterIIR {
+    double x_vec[20];
+    double y_vec[20];
+    double b[20];
+    double a[20];
+    double G;
+    int N;
+    filterIIR(int N_points, double *b_coeff, double *a_coeff, double gain = 1){
+        N = N_points;
+        G = gain;
+        bzero(x_vec, N*sizeof(double));
+        bzero(y_vec, N*sizeof(double));
+        bzero(b, N*sizeof(double));
+        bzero(a, N*sizeof(double));
+        if(b_coeff != NULL)
+            memcpy(b, b_coeff, N*sizeof(double));
+        if(a_coeff != NULL)
+            memcpy(a, a_coeff, N*sizeof(double));
+    }
+    double filtering(double x){
+        double ma = 0;
+        double ar = 0;
+        memmove(x_vec + 1, x_vec, (N-1)*sizeof(double));
+        memmove(y_vec + 1, y_vec, (N-1)*sizeof(double));
+        x_vec[0] = x;
+        // moving average
+        for(int n=0; n < N; n++){
+            ma += b[n]*x_vec[n];
+        }
+        // auto regressive
+        for(int n=1; n < N; n++){
+            ar += (-1)*a[n]*y_vec[n];
+        }
+        y_vec[0] = ar + G*ma;
+        return y_vec[0];
+    }
+} filterIIR;
+
+typedef struct butterworth {
+  double x_vec[3];
+  double y_vec[3];
+  double b[3];
+  double a[3];
+  double b_coeff[3];
+  double a_coeff[3];
+  double G;
+  int N = 3;
+  butterworth(double wn){
+    G = wn*wn/(4/(PI*PI)-2*sqrt(2)*wn/PI+wn*wn);
+    bzero(x_vec, N*sizeof(double));
+    bzero(y_vec, N*sizeof(double));
+    bzero(b, N*sizeof(double));
+    bzero(a, N*sizeof(double));
+    b_coeff[0] = 1;
+    b_coeff[1] = 2;
+    b_coeff[2] = 1;
+    a_coeff[2] = 1;
+    a_coeff[1] = (2*pow(wn,2)-8/(pow(M_PI,2)))/(4/(pow(M_PI,2))-2*sqrt(2)*wn/M_PI+pow(wn,2));
+    a_coeff[0] = (4/(pow(M_PI,2))+2*sqrt(2)*wn/M_PI+pow(wn,2))/(4/(pow(M_PI,2))-2*sqrt(2)*wn/M_PI+pow(wn,2));
+    double aa = M_PI;
+    if(b_coeff != NULL)
+      memcpy(b, b_coeff, N*sizeof(double));
+    if(a_coeff != NULL)
+      memcpy(a, a_coeff, N*sizeof(double));
+  }
+  double filtering(double x){
+    double ma = 0;
+    double ar = 0;
+    memmove(x_vec + 1, x_vec, (N-1)*sizeof(double));
+    memmove(y_vec + 1, y_vec, (N-1)*sizeof(double));
+    x_vec[0] = x;
+    // moving average
+    for(int n=0; n < N; n++){
+      ma += b[n]*x_vec[n];
+    }
+    // auto regressive
+    for(int n=1; n < N; n++){
+      ar += (-1)*a[n]*y_vec[n];
+    }
+    y_vec[0] = (ar + G*ma)/a_coeff[0];
+    return y_vec[0];
+    }
+} butterworth;
+
+double Gain_butter = 0.0201;
+double b_butter[3] = {1, 2, 1};
+double a_butter[3] = {1, -1.5610, 0.6414};
+
+//filterIIR filterPos(b_win, NULL, 5);
+//filterIIR filterPos(3, b_butter, a_butter, Gain_butter);
+butterworth filterPosB(0.15);
+//filterIIR filterVel(b_hamm, NULL, 20);
+
+///////////////////////////////////////
+//     MQTT Configuration   ///////////
+///////////////////////////////////////
+const char* ssid = "fvp";
+const char* password = "nomeacuerdo";
+//const char* ssid = "GTD-3813230";
+//const char* password= "g6yWsKswphfs";
+//const char* ssid = "KATRINA";
+//const char* password = "wlan70634f";
+//const char* ssid = "MOVISTAR_7502";
+//const char* password = "X27JgSvWteS2US4";
+
+//const char* mqtt_server = "192.168.1.100";  // IP fvp
+//const char* mqtt_server = "192.168.1.114";
+const char* mqtt_server = "192.168.1.101";
+
+/* UDP Settings */
+WiFiUDP udp;
+uint32_t udp_port = 3333;
+const char* udp_server = "192.168.1.104";
+double udp_buffer[PAYLOAD_SIZE];
+uint32_t t_udp = 0;
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+long lastMsg = 0;  
+char msg[50];
+
+////////////////////////////////////////////
+//      ESP-NOW Configuration       ////////
+////////////////////////////////////////////
+
+uint8_t mac_leader[] = {0x1A, 0x2B, 0x3C, 0x4D, 0x5E, 0x6F};        // custom MAC
+uint8_t mac_list[][6] = { {0x24, 0x0A, 0xC4, 0x31, 0x34, 0x18},   // lider
+                          {0x24, 0x0A, 0xC4, 0x32, 0x0E, 0x20},   // 2do
+                          {0x24, 0x0A, 0xC4, 0x32, 0x14, 0x80},   // 3ro
+                          {0x24, 0x0A, 0xC4, 0x32, 0x37, 0xAC}    // 4to
+                        };  
+uint8_t mac_addr_broadcast[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+bool received, resend;      // control variables
+uint32_t rcv_time = 0;
+
+typedef struct {
+    uint32_t timestamp;
+    double position;
+    double velocity;
+} ESPNOW_payload;
+
+//ESPNOW_payload monitor_data;
+double monitor_data[5];
+double data_com[2];
+ESPNOW_payload rcv_data;
+
+esp_now_peer_info_t peerInfo;   // struct to add peers to ESPNOW
+
+////////////////////////////////////////////////////
+//          DC Motor Configuration      ////////////
+////////////////////////////////////////////////////
+const int Control_fwd = 25;                //  Pin AIN1  [rotation direction + control]
+const int Control_back = 26;            //  Pin AIN2   [rotation direction - control]
+const int Control_v = 12;                 //  Pin PWM [speed control]
+
+const int encoder0 = 36;
+const int encoder1 = 39;
+
+volatile unsigned long last_encoder0;
+volatile unsigned long last_encoder1;
+volatile int pulses0, pulses1;
+volatile int lastState0, lastState1;
+
+unsigned long time1 = 0;
+double period1 = 0.0;
+double frequency1 = 0.0;
+double last_position = 0.0;
+
+portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+
+void IRAM_ATTR encoder_isr() {
+  portENTER_CRITICAL_ISR(&mux);
+  int state0 = digitalRead(encoder0);
+  int state1 = digitalRead(encoder1);
+  if (state0 != lastState0 || state1 != lastState1) {
+    unsigned long now = micros();
+    if (state0 != lastState0) {
+      lastState0 = state0;
+      pulses0++;
+    }
+    if (state1 != lastState1) {
+      lastState1 = state1;
+      pulses1++;
+    }
+    last_encoder0 = now;
+    last_encoder1 = now;
+  }
+  portEXIT_CRITICAL_ISR(&mux);
+}
+
+double Setpoint = 0, Input = 0, Output = 0;
+double kp = 5, ki = 0.01, kd = 0.01;
+double kp_v = 4, ki_v = 0.01, kd_v = 0.01;
+double desfase = 0.0;
+double corr_vel = 0.0;
+
+PID Pos_PID(&Input, &Output, &Setpoint, kp, ki, kd, DIRECT);
+PID Vel_PID(&corr_vel, &Output, &desfase, kp_v, ki_v, kd_v, DIRECT);
+
+double f_s = 1.0/(double)Ts*1000.0;
+
+uint8_t checkSum(uint8_t *buff, int len) {
+  uint8_t sum = 0;
+  for(int i = 0; i < len; i++) sum += buff[i];
+  return sum;
+}
+
+void callback(char* topic, byte* payload, unsigned int length) {
+  String msg;
+  for (int i = 0; i < length; i++) {
+    msg += (char)payload[i];
+  }
+  msg.trim();
+  if (String(topic) == trenesp) {
+    kp = msg.toDouble();
+    Pos_PID.SetTunings(kp, ki, kd);
+  } else if (String(topic) == trenesi) {
+    ki = msg.toDouble();
+    Pos_PID.SetTunings(kp, ki, kd);
+  } else if (String(topic) == trenesd) {
+    kd = msg.toDouble();
+    Pos_PID.SetTunings(kp, ki, kd);
+  } else if (String(topic) == trenesp_v) {
+    kp_v = msg.toDouble();
+    Vel_PID.SetTunings(kp_v, ki_v, kd_v);
+  } else if (String(topic) == trenesi_v) {
+    ki_v = msg.toDouble();
+    Vel_PID.SetTunings(kp_v, ki_v, kd_v);
+  } else if (String(topic) == trenesd_v) {
+    kd_v = msg.toDouble();
+    Vel_PID.SetTunings(kp_v, ki_v, kd_v);
+  } else if (String(topic) == trenesdesfase) {
+    desfase = msg.toDouble();
+  } else if (String(topic) == trenessampletime) {
+    Ts = msg.toInt();
+  } else if (String(topic) == trenestransmision) {
+    t_envio = msg.toInt();
+  }
+}
+
+void reconnect() {
+  while (!client.connected()) {
+    if (client.connect(carro.c_str())) {
+      client.subscribe(trenesp);
+      client.subscribe(trenesi);
+      client.subscribe(trenesd);
+      client.subscribe(trenesp_v);
+      client.subscribe(trenesi_v);
+      client.subscribe(trenesd_v);
+      client.subscribe(trenesdesfase);
+      client.subscribe(trenessampletime);
+      client.subscribe(trenestransmision);
+    } else {
+      delay(5000);
+    }
+  }
+}
+
+void initESPNow() {
+  if (esp_now_init() != ESP_OK) {
+    return;
+  }
+  esp_now_register_recv_cb(OnDataRecv);
+  memcpy(peerInfo.peer_addr, mac_list[n_carro], 6);
+  peerInfo.channel = CHANNEL;
+  peerInfo.encrypt = false;
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    return;
+  }
+}
+
+void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
+  memcpy(&rcv_data, incomingData, sizeof(rcv_data));
+  received = true;
+  rcv_time = millis();
+}
+
+void setup() {
+  pinMode(Control_fwd, OUTPUT);
+  pinMode(Control_back, OUTPUT);
+  pinMode(Control_v, OUTPUT);
+  pinMode(encoder0, INPUT_PULLUP);
+  pinMode(encoder1, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(encoder0), encoder_isr, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(encoder1), encoder_isr, CHANGE);
+  Serial.begin(115200);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+  }
+  client.setServer(mqtt_server, 1883);
+  client.setCallback(callback);
+  udp.begin(udp_port);
+  initESPNow();
+  Pos_PID.SetSampleTime(Ts);
+  Pos_PID.SetMode(AUTOMATIC);
+  Vel_PID.SetSampleTime(Ts);
+  Vel_PID.SetMode(AUTOMATIC);
+}
+
+void loop() {
+  if (!client.connected()) {
+    reconnect();
+  }
+  client.loop();
+  unsigned long now = millis();
+  if (received) {
+    monitor_data[0] = millis();
+    monitor_data[1] = rcv_data.position;
+    monitor_data[2] = rcv_data.velocity;
+    monitor_data[3] = Output;
+    monitor_data[4] = Input;
+    received = false;
+    digitalWrite(ONBOARD_LED, HIGH);
+  } else {
+    digitalWrite(ONBOARD_LED, LOW);
+  }
+  Input = filterPosB.filtering(rcv_data.position);
+  corr_vel = rcv_data.velocity;
+  Pos_PID.Compute();
+  Vel_PID.Compute();
+  if (millis() - lastMsg > t_envio) {
+    lastMsg = millis();
+    udp.beginPacket(udp_server, udp_port);
+    udp.write((uint8_t*)monitor_data, sizeof(monitor_data));
+    udp.endPacket();
+  }
+  if (millis() - rcv_time > DELAY_CAM) {
+    rcv_data.position = 0.0;
+    rcv_data.velocity = 0.0;
+  }
+}
